@@ -7,6 +7,7 @@ from nonebot import get_bots, logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from redis.exceptions import RedisError
 
+from . import sending
 from .client import Client
 from .config import Config
 from .models import Names
@@ -118,25 +119,29 @@ class Worker:
                 await self.store.finish(message_id, task, "cancelled")
                 continue
             available = self.bots()
-            bot = next(
-                (
-                    available[identity]
-                    for identity in candidates
-                    if isinstance(available.get(identity), Bot)
-                ),
+            bot_id = next(
+                (identity for identity in candidates if isinstance(available.get(identity), Bot)),
                 None,
             )
-            if bot is None:
+            if bot_id is None:
                 await self.store.defer(message_id, now)
                 continue
+            bot = available[bot_id]
             try:
-                response = await asyncio.wait_for(
-                    bot.send_group_msg(
-                        group_id=int(task["group"]),
-                        message=Message(MessageSegment.text(task["message"])),
-                    ),
-                    timeout=20,
-                )
+                async with sending.limiter.slot():
+                    # 等待全局发送间隔后重新确认租约与订阅，避免等待期间失效。
+                    if not await self.store.renew():
+                        self.active.clear()
+                        return
+                    if bot_id not in await self.store.matching_bots(task):
+                        continue
+                    response = await asyncio.wait_for(
+                        bot.send_group_msg(
+                            group_id=int(task["group"]),
+                            message=Message(MessageSegment.text(task["message"])),
+                        ),
+                        timeout=20,
+                    )
                 if (
                     not isinstance(response, dict)
                     or type(response.get("message_id")) is not int

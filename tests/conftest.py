@@ -70,6 +70,21 @@ def redis_url(tmp_path_factory):
 
 
 @pytest.fixture
+def send_limiter(monkeypatch):
+    from nonebot_plugin_vrpsp_entry import sending
+
+    instance = sending.SendLimiter()
+    monkeypatch.setattr(sending, "limiter", instance)
+    return instance
+
+
+@pytest.fixture(autouse=True)
+def isolate_send_limiter(send_limiter):
+    # 每个测试的独立事件循环使用新的锁；不更改生产发送间隔。
+    return send_limiter
+
+
+@pytest.fixture
 async def store(redis_url):
     from nonebot_plugin_vrpsp_entry.config import Config
     from nonebot_plugin_vrpsp_entry.store import Store

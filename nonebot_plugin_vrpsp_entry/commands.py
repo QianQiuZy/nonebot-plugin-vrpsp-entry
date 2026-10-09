@@ -6,6 +6,7 @@ from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from redis.exceptions import RedisError
 
+from . import sending
 from .config import is_allowed
 from .models import parse_id
 from .worker import Worker
@@ -18,11 +19,11 @@ def register(worker: Worker) -> dict:
 
     async def group_only(matcher: Matcher, event: MessageEvent):
         if not isinstance(event, GroupMessageEvent):
-            await matcher.finish("请在需要订阅的群聊中使用此指令")
+            await sending.finish(matcher, "请在需要订阅的群聊中使用此指令")
 
     async def check(matcher: Matcher, event: MessageEvent):
         if not is_allowed(worker.config, event.user_id):
-            await matcher.finish(DENIED)
+            await sending.finish(matcher, DENIED)
         await group_only(matcher, event)
 
     def management(kind: str, remove: bool):
@@ -42,7 +43,9 @@ def register(worker: Worker) -> dict:
             try:
                 identity = parse_id(args.extract_plain_text().strip())
             except ValueError:
-                await matcher.finish(f"用法：/{name} <{'房间号' if kind == 'room' else 'UID'}>")
+                await sending.finish(
+                    matcher, f"用法：/{name} <{'房间号' if kind == 'room' else 'UID'}>"
+                )
             display = worker.names.room(identity) if kind == "room" else worker.names.user(identity)
             try:
                 if remove:
@@ -54,9 +57,9 @@ def register(worker: Worker) -> dict:
                     )
                     text = "已订阅" if changed else "本群已订阅"
             except RedisError:
-                await matcher.finish("Redis 暂不可用，请稍后查询或重试")
+                await sending.finish(matcher, "Redis 暂不可用，请稍后查询或重试")
             suffix = "；仅推送订阅后的新入场" if changed and not remove else ""
-            await matcher.finish(f"{text}{noun}：{display}（{identity}）{suffix}")
+            await sending.finish(matcher, f"{text}{noun}：{display}（{identity}）{suffix}")
 
         return command
 
@@ -72,9 +75,9 @@ def register(worker: Worker) -> dict:
         try:
             rows = await worker.store.subscriptions(str(event.group_id))
         except RedisError:
-            await matcher.finish("Redis 暂不可用，请稍后再试")
+            await sending.finish(matcher, "Redis 暂不可用，请稍后再试")
         if not rows:
-            await matcher.finish("本群暂无入场订阅")
+            await sending.finish(matcher, "本群暂无入场订阅")
         text = "本群入场订阅："
         for field in sorted(rows):
             _, kind, value = field.split(":")
@@ -83,10 +86,10 @@ def register(worker: Worker) -> dict:
             label = "房间" if kind == "room" else "用户"
             line = f"\n{label}：{name}（{identity}）"
             if len(text) + len(line) > 1800:
-                await matcher.send(text)
+                await sending.send(matcher, text)
                 text = "本群入场订阅（续）："
             text += line
-        await matcher.finish(text)
+        await sending.finish(matcher, text)
 
     commands["list"] = listing
 
@@ -98,7 +101,7 @@ def register(worker: Worker) -> dict:
         try:
             rows = await worker.store.subscriptions(str(event.group_id))
         except RedisError:
-            await matcher.finish("Redis 暂不可用，请稍后再试")
+            await sending.finish(matcher, "Redis 暂不可用，请稍后再试")
         rooms, users = [], []
         for field in sorted(rows):
             _, kind, value = field.split(":")
@@ -114,9 +117,9 @@ def register(worker: Worker) -> dict:
         )
         # 大量订阅时分段，仍只显示当前群的名称。
         while len(text) > 1800:
-            await matcher.send(text[:1800])
+            await sending.send(matcher, text[:1800])
             text = text[1800:]
-        await matcher.finish(text)
+        await sending.finish(matcher, text)
 
     commands["public_list"] = public_listing
     return commands
