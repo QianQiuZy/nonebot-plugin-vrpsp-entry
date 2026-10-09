@@ -1,0 +1,41 @@
+[project]
+name = "nonebot-plugin-vrpsp-entry"
+version = "0.1.0"
+description = "VR / PSP 入场群订阅，Redis 5 持久化与 QQ 白名单管理"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "nonebot2>=2.3.3,<3",
+    "nonebot-adapter-onebot>=2.4.5,<3",
+    "httpx>=0.27,<1",
+    "redis>=5.0,<6",
+    "pydantic>=2.7,<3",
+]
+
+[dependency-groups]
+dev = [
+    "nonebot2[fastapi]>=2.3.3,<3",
+    "nonebug>=0.4,<1",
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.25,<2",
+    "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nonebot_plugin_vrpsp_entry"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
