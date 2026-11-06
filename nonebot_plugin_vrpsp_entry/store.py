@@ -37,7 +37,8 @@ for index = 2, 3 do
     if value then
         local sub = cjson.decode(value)
         if tonumber(sub.since_us) <= tonumber(ARGV[4]) then
-            table.insert(matches, {field=ARGV[index], token=sub.token, bot_id=sub.bot_id})
+            local bot_id = ARGV[7] ~= '' and ARGV[7] or sub.bot_id
+            table.insert(matches, {field=ARGV[index], token=sub.token, bot_id=bot_id})
         end
     end
 end
@@ -117,7 +118,9 @@ class Store:
             if group is None or field.startswith(group + ":")
         }
 
-    async def enqueue(self, group: str, entry: Entry, message: str) -> bool:
+    async def enqueue(
+        self, group: str, entry: Entry, message: str, bot_id: str | None = None
+    ) -> bool:
         key = entry.delivery_key(group)
         task = json.dumps({"group": group, "key": key, "message": message}, ensure_ascii=False)
         return bool(
@@ -134,6 +137,7 @@ class Store:
                 entry.time_us,
                 task,
                 DEDUPE_SECONDS,
+                bot_id or "",
             )
         )
 
@@ -147,15 +151,13 @@ class Store:
             for message_id, fields in items
         ]
 
-    async def matching_bots(self, task: dict) -> list[str]:
+    async def has_matching_subscription(self, task: dict) -> bool:
         matches = task["matches"]
         rows = await self.redis.hmget(self.subs, [match["field"] for match in matches])
-        return sorted(
-            {
-                match["bot_id"]
-                for match, value in zip(matches, rows, strict=True)
-                if value and json.loads(value)["token"] == match["token"]
-            }
+        # 订阅有效性只按 token 校验；任务所属账号由发送端另行检查。
+        return any(
+            value and json.loads(value)["token"] == match["token"]
+            for match, value in zip(matches, rows, strict=True)
         )
 
     async def retry_due(self, message_id: str, now: float) -> bool:

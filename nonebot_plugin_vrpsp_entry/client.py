@@ -6,8 +6,12 @@ from .models import Entry, parse_entries
 
 class Client:
     def __init__(self, config: Config):
-        self.urls = {"vr": config.vrpsp_entry_vr_url, "psp": config.vrpsp_entry_psp_url}
-        # 两个已知中国大陆接口直连，不继承宿主外网代理。
+        self.urls = {
+            "vr": config.vrpsp_entry_vr_url,
+            "psp": config.vrpsp_entry_psp_url,
+            "vup": config.vrpsp_entry_vup_url,
+        }
+        # 已知中国大陆接口直连，不继承宿主外网代理。
         self.http = httpx.AsyncClient(
             timeout=config.vrpsp_entry_http_timeout,
             trust_env=False,

@@ -8,9 +8,10 @@ class Config(BaseModel):
     vrpsp_entry_key_prefix: str = "vrpsp_entry:"
     vrpsp_entry_poll_seconds: float = Field(default=30, ge=5, le=300)
     vrpsp_entry_http_timeout: float = Field(default=10, gt=0, le=20)
-    vrpsp_entry_sources: set[str] = Field(default_factory=lambda: {"vr", "psp"})
+    vrpsp_entry_sources: set[str] = Field(default_factory=lambda: {"vr", "psp", "vup"})
     vrpsp_entry_vr_url: str = "https://vr.qianqiuzy.cn/gift/entry"
     vrpsp_entry_psp_url: str = "https://psp.qianqiuzy.cn/gift/entry"
+    vrpsp_entry_vup_url: str = "https://vup.qianqiuzy.cn/gift/entry"
 
     @field_validator("vrpsp_entry_key_prefix")
     @classmethod
@@ -22,8 +23,8 @@ class Config(BaseModel):
     @field_validator("vrpsp_entry_sources")
     @classmethod
     def valid_sources(cls, value: set[str]) -> set[str]:
-        if not value <= {"vr", "psp"} or not value:
-            raise ValueError("sources must contain vr and/or psp")
+        if not value <= {"vr", "psp", "vup"} or not value:
+            raise ValueError("sources must contain one or more of vr, psp, vup")
         return value
 
 

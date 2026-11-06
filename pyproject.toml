@@ -1,7 +1,7 @@
 [project]
 name = "nonebot-plugin-vrpsp-entry"
 version = "0.1.0"
-description = "VR / PSP 入场群订阅，Redis 5 持久化与 QQ 白名单管理"
+description = "VR / PSP / VUP 入场群订阅，Redis 5 持久化与 QQ 白名单管理"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

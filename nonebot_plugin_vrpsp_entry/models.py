@@ -30,7 +30,7 @@ class Entry:
         return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
 
     def delivery_key(self, group: str) -> str:
-        # 来源和 Bot ID 不参与：同一事件命中 VR/PSP、房间/用户都只投递一次。
+        # 来源和 Bot ID 不参与：同一事件命中 VR/PSP/VUP、房间/用户都只投递一次。
         raw = f"{group}:{self.room_id}:{self.uid}:{self.time_us}"
         return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -66,7 +66,7 @@ class Names:
         rows = json.loads((directory / "entry_users.json").read_text(encoding="utf-8-sig"))
         self.users = {parse_id(str(row["uid"])): str(row["name"]) for row in rows}
         self.rooms: dict[int, str] = {}
-        for filename in ("rooms.json", "psp_rooms.json"):
+        for filename in ("rooms.json", "psp_rooms.json", "vup_rooms.json"):
             data = json.loads((directory / filename).read_text(encoding="utf-8-sig"))
             self.rooms.update(
                 {parse_id(room): str(name) for room, name in data["room_anchors"].items()}

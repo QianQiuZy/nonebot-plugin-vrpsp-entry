@@ -1,9 +1,10 @@
 # nonebot-plugin-vrpsp-entry
 
-NoneBot2 / OneBot v11 的 VR、PSP 入场群订阅插件。默认每 30 秒分别请求：
+NoneBot2 / OneBot v11 的 VR、PSP、VUP 入场群订阅插件。默认每 30 秒分别请求：
 
 - `https://vr.qianqiuzy.cn/gift/entry?cache=1`
 - `https://psp.qianqiuzy.cn/gift/entry?cache=1`
+- `https://vup.qianqiuzy.cn/gift/entry?cache=1`
 
 订阅、消息去重、待发送队列和重试状态持久化到 Redis，兼容 Redis **5.0.14.1**。
 只使用独立键前缀，不清空数据库、不迁移数据、不修改 Redis 服务配置。
@@ -42,7 +43,7 @@ nonebot.load_plugin("nonebot_plugin_vrpsp_entry")
 /入场订阅
 ```
 
-房间订阅接收该房间内的访客入场；用户订阅接收该 UID 在 VR、PSP 接口覆盖的所有房间中的入场。
+房间订阅接收该房间内的访客入场；用户订阅接收该 UID 在 VR、PSP、VUP 接口覆盖的所有房间中的入场。
 订阅按群隔离，重复订阅不会重置订阅时间。仅推送**订阅创建时间之后**的事件，
 因此第一次订阅不会补发最近 10 分钟的旧记录。私聊中不能管理群订阅。
 
@@ -80,12 +81,17 @@ nonebot.load_plugin("nonebot_plugin_vrpsp_entry")
 | `VRPSP_ENTRY_KEY_PREFIX` | `vrpsp_entry:` | 本插件独立键前缀，不可为空 |
 | `VRPSP_ENTRY_POLL_SECONDS` | `30` | 轮询间隔，5～300 秒 |
 | `VRPSP_ENTRY_HTTP_TIMEOUT` | `10` | 单次请求超时，最多 20 秒 |
-| `VRPSP_ENTRY_SOURCES` | `["vr","psp"]` | 启用的数据源 |
+| `VRPSP_ENTRY_SOURCES` | `["vr","psp","vup"]` | 启用的数据源 |
 | `VRPSP_ENTRY_VR_URL` | `https://vr.qianqiuzy.cn/gift/entry` | VR 入场接口，不带 query |
 | `VRPSP_ENTRY_PSP_URL` | `https://psp.qianqiuzy.cn/gift/entry` | PSP 入场接口，不带 query |
+| `VRPSP_ENTRY_VUP_URL` | `https://vup.qianqiuzy.cn/gift/entry` | VUP 入场接口，不带 query |
 
-VR 暂未部署时可设置 `VRPSP_ENTRY_SOURCES=["psp"]`。两源并行查询，一个返回 404、429、503、
-超时或非法 JSON 时另一个仍可正常处理；失败源在下一轮重试。两个已知大陆接口直连，
+已有宿主若显式设置了 `VRPSP_ENTRY_SOURCES=["vr","psp"]`，需改为
+`VRPSP_ENTRY_SOURCES=["vr","psp","vup"]` 才会启用新增源；未显式设置时默认启用三源。
+VUP 沿用相同的房间/用户订阅指令及跨源去重规则，无需重新订阅。
+
+VR 暂未部署时可设置 `VRPSP_ENTRY_SOURCES=["psp"]`。启用的数据源并行查询，任一源返回 404、429、503、
+超时或非法 JSON 时其他源仍可正常处理；失败源在下一轮重试。三个已知大陆接口直连，
 客户端不继承宿主外网代理。不将开发用本机代理写入业务配置。
 
 ## 名称资源与上游契约
@@ -93,7 +99,7 @@ VR 暂未部署时可设置 `VRPSP_ENTRY_SOURCES=["psp"]`。两源并行查询�
 `nonebot_plugin_vrpsp_entry/resource/` 内含来自本次 `VR_douchong` 工作树的：
 
 - `entry_users.json`：`[{"uid":1048135385,"name":"花礼Harei"}, ...]`
-- `rooms.json`、`psp_rooms.json`：`room_ids` 与 `room_anchors` 名称映射。
+- `rooms.json`、`psp_rooms.json`、`vup_rooms.json`：`room_ids` 与 `room_anchors` 名称映射。
 
 资源随包安装，按插件文件所在目录读取，不依赖宿主工作目录。维护名称后重启 Bot。
 这里的资源用于显示名称，修改本地名单不能改变服务端实际采集范围。
@@ -116,7 +122,7 @@ VR 暂未部署时可设置 `VRPSP_ENTRY_SOURCES=["psp"]`。两源并行查询�
 ## 去重与发送恢复
 
 每个群以“群号 + 房间号 + UID + 标准化入场时间”标识一条通知。房间订阅和用户订阅重叠、
-同一事件反复轮询、VR/PSP 同时返回相同事件，都只入队一次。同 UID 再次进入时若时间不同，
+同一事件反复轮询、VR/PSP/VUP 同时返回相同事件，都只入队一次。同 UID 再次进入时若时间不同，
 仍视为新的入场；不同群各收到一次。去重键保留 24 小时，超过接口 10 分钟窗口。
 
 Lua 原子检查订阅并创建去重标记与 Redis Stream 任务。Stream 消费组使用 Redis 5 支持的
@@ -130,7 +136,18 @@ Lua 原子检查订阅并创建去重标记与 Redis Stream 任务。Stream 消�
 
 取消订阅会使该订阅对应的待发送任务失效；若另一条原订阅仍然匹配，则继续发送。
 取消后重新订阅产生新标识，不复活旧任务。已经开始向 OneBot 发出的请求无法撤回。
-订阅绑定创建它的 Bot QQ；该 Bot 离线时等待其重连，避免误发给另一个 Bot。
+适用于一个 NoneBot 进程、同时仅一个在线 OneBot v11 QQ 的宿主。发送时使用当前在线账号，
+不以订阅中保存的历史 Bot QQ 限制新事件发送；更换 QQ 后无需迁移 Redis 或重新订阅，
+原订阅时间继续有效。新账号须已加入需要接收通知的群，并具备发言权限。
+任务中的 `bot_id` 记录入队时的账号；旧格式任务沿用其已有账号字段，无需迁移。
+当前账号与任务账号不符时，丢弃该积压任务并清理队列和重试状态，保留去重标记以避免重复入队。
+因此跨 QQ 不补发旧积压，换号后新入队的事件正常发送。同号离线重连仍保留任务并退避重试，
+重试时间最长约 300 秒。运行期间离线入队沿用最近连接的账号；进程启动后首次连接账号前暂停
+轮询，避免猜测任务归属；这段时间超过上游 10 分钟窗口的未采集事件无法补抓。
+所有待发任务自入队起最多保留一小时，到期后由发送循环清理，即使账号离线或尚未到重试时间
+也会失效；清理时保留去重标记，避免缓存中的同一事件再次入队。入队时间读取 Redis Stream ID，
+已有积压任务同样适用，无需迁移。NoneBot 停止期间不执行清理，重新启动后检查并丢弃过期任务。
+订阅保存内容与 Redis 数据结构保持不变；取消及重新订阅仍按订阅标识使旧任务失效。
 
 60 秒 Redis 租约每 10 秒续期，同一键前缀只允许一个后台工作实例，防止多进程正常运行时
 重复投递。多实例必须使用相同配置与数据源，独立 Bot 服务应使用不同键前缀。

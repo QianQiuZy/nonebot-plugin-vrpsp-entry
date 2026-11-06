@@ -13,6 +13,8 @@ from .config import Config
 from .models import Names
 from .store import Store
 
+TASK_MAX_AGE_SECONDS = 3600
+
 
 class Worker:
     def __init__(self, config: Config, bots: Callable = get_bots):
@@ -24,6 +26,14 @@ class Worker:
         self.active = asyncio.Event()
         self.tasks: list[asyncio.Task] = []
         self.pending_cursor = "0"
+        self.last_bot_id: str | None = None
+
+    def current_bot(self) -> tuple[str, Bot] | None:
+        for identity, bot in self.bots().items():
+            if isinstance(bot, Bot):
+                self.last_bot_id = identity
+                return identity, bot
+        return None
 
     async def start(self) -> None:
         if self.tasks:
@@ -66,10 +76,16 @@ class Worker:
     async def poll_once(self) -> None:
         if self.client is None:
             return
+        self.current_bot()
+        # 同号短暂离线时沿用最近账号；启动后尚未连接过账号时不猜测任务归属。
+        if self.last_bot_id is None:
+            return
         sources = sorted(self.config.vrpsp_entry_sources)
         results = await asyncio.gather(
             *(self.client.fetch(source) for source in sources), return_exceptions=True
         )
+        self.current_bot()
+        bot_id = self.last_bot_id
         subscriptions = await self.store.subscriptions()
         now_us = await self.store.time_us()
         rooms: dict[int, set[str]] = {}
@@ -88,7 +104,7 @@ class Worker:
                     continue
                 groups = rooms.get(entry.room_id, set()) | users.get(entry.uid, set())
                 for group in sorted(groups):
-                    await self.store.enqueue(group, entry, self.names.message(entry))
+                    await self.store.enqueue(group, entry, self.names.message(entry), bot_id)
 
     async def poll_loop(self) -> None:
         while True:
@@ -112,28 +128,45 @@ class Worker:
                 self.active.clear()
                 return
             now = (await self.store.time_us()) / 1_000_000
-            if not await self.store.retry_due(message_id, now):
+            # Stream ID 的毫秒时间就是入队时间，旧任务无需迁移即可检查有效期。
+            queued_at = int(message_id.split("-", 1)[0]) / 1000
+            if now - queued_at >= TASK_MAX_AGE_SECONDS:
+                await self.store.finish(message_id, task, "expired")
                 continue
-            candidates = await self.store.matching_bots(task)
-            if not candidates:
+            if not await self.store.has_matching_subscription(task):
                 await self.store.finish(message_id, task, "cancelled")
                 continue
-            available = self.bots()
-            bot_id = next(
-                (identity for identity in candidates if isinstance(available.get(identity), Bot)),
-                None,
-            )
-            if bot_id is None:
+            current = self.current_bot()
+            if current is not None and not any(
+                match["bot_id"] == current[0] for match in task["matches"]
+            ):
+                await self.store.finish(message_id, task, "account_changed")
+                continue
+            if not await self.store.retry_due(message_id, now):
+                continue
+            if current is None:
                 await self.store.defer(message_id, now)
                 continue
-            bot = available[bot_id]
+            bot_id, bot = current
             try:
                 async with sending.limiter.slot():
                     # 等待全局发送间隔后重新确认租约与订阅，避免等待期间失效。
                     if not await self.store.renew():
                         self.active.clear()
                         return
-                    if bot_id not in await self.store.matching_bots(task):
+                    if (await self.store.time_us()) / 1_000_000 - queued_at >= TASK_MAX_AGE_SECONDS:
+                        await self.store.finish(message_id, task, "expired")
+                        continue
+                    if not await self.store.has_matching_subscription(task):
+                        continue
+                    # 等待限速期间也可能换号，必须重新取得连接并校验任务账号。
+                    current = self.current_bot()
+                    if current is None:
+                        await self.store.defer(message_id, now)
+                        continue
+                    bot_id, bot = current
+                    if not any(match["bot_id"] == bot_id for match in task["matches"]):
+                        await self.store.finish(message_id, task, "account_changed")
                         continue
                     response = await asyncio.wait_for(
                         bot.send_group_msg(

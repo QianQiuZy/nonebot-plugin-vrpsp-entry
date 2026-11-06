@@ -46,12 +46,12 @@ async def test_cancel_only_discards_task_when_all_matches_removed(store):
     entry = await new_entry(store)
     await store.enqueue("10", entry, "message")
     _, task = (await store.read(">"))[0]
-    assert await store.matching_bots(task) == ["1", "2"]
+    assert await store.has_matching_subscription(task)
     await store.unsubscribe("10", "room", entry.room_id)
-    assert await store.matching_bots(task) == ["2"]
+    assert await store.has_matching_subscription(task)
     await store.unsubscribe("10", "user", entry.uid)
     await store.subscribe("10", "user", entry.uid, "2")
-    assert await store.matching_bots(task) == []
+    assert not await store.has_matching_subscription(task)
 
 
 async def test_restart_recovers_pending_and_ack_cleans_queue(store, redis_url):

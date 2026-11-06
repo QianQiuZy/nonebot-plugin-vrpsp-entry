@@ -6,8 +6,8 @@ from .config import Config
 from .worker import Worker
 
 __plugin_meta__ = PluginMetadata(
-    name="VR/PSP入场订阅",
-    description="每30秒查询 VR/PSP 入场事件，按群订阅房间或用户，Redis5持久化去重",
+    name="VR/PSP/VUP入场订阅",
+    description="每30秒查询 VR/PSP/VUP 入场事件，按群订阅房间或用户，Redis5持久化去重",
     usage="/入场房间订阅 <房间号>\n/入场用户订阅 <UID>\n"
     "/入场房间订阅取消 <房间号>\n/入场用户订阅取消 <UID>\n/入场订阅",
     type="application",
