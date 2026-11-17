@@ -10,7 +10,7 @@ from redis.exceptions import RedisError
 from . import sending
 from .client import Client
 from .config import Config
-from .models import Names
+from .models import POCKET_NAMES, Names, RedPocket
 from .store import Store
 
 TASK_MAX_AGE_SECONDS = 3600
@@ -90,21 +90,40 @@ class Worker:
         now_us = await self.store.time_us()
         rooms: dict[int, set[str]] = {}
         users: dict[int, set[str]] = {}
+        pockets: dict[str, set[str]] = {}
         for field in subscriptions:
             group, kind, identity = field.split(":")
-            index = rooms if kind == "room" else users
-            index.setdefault(int(identity), set()).add(group)
+            if kind in {"room", "user"}:
+                index = rooms if kind == "room" else users
+                index.setdefault(int(identity), set()).add(group)
+            elif kind.removeprefix("pocket_") in POCKET_NAMES:
+                pockets.setdefault(kind.removeprefix("pocket_"), set()).add(group)
         for source, result in zip(sources, results, strict=True):
             if isinstance(result, BaseException):
                 # 不输出响应、URL 或连接凭据；VR 失败不妨碍 PSP。
                 logger.warning("入场 {} 接口异常：{}", source.upper(), type(result).__name__)
                 continue
             for entry in result:
+                if isinstance(entry, RedPocket):
+                    if not entry.time_us <= now_us < entry.time_us + 600_000_000:
+                        continue
+                    for group in sorted(pockets.get(entry.pocket_type, set())):
+                        await self.store.enqueue_pocket(
+                            group, entry, self.names.pocket_message(entry), bot_id
+                        )
+                    continue
                 if not now_us - 600_000_000 <= entry.time_us <= now_us:
                     continue
                 groups = rooms.get(entry.room_id, set()) | users.get(entry.uid, set())
                 for group in sorted(groups):
                     await self.store.enqueue(group, entry, self.names.message(entry), bot_id)
+
+    @staticmethod
+    def task_expired(message_id: str, task: dict, now_us: int) -> bool:
+        queued_us = int(message_id.split("-", 1)[0]) * 1000
+        return now_us - queued_us >= TASK_MAX_AGE_SECONDS * 1_000_000 or (
+            "expires_us" in task and now_us >= int(task["expires_us"])
+        )
 
     async def poll_loop(self) -> None:
         while True:
@@ -127,10 +146,10 @@ class Worker:
             if not await self.store.renew():
                 self.active.clear()
                 return
-            now = (await self.store.time_us()) / 1_000_000
+            now_us = await self.store.time_us()
+            now = now_us / 1_000_000
             # Stream ID 的毫秒时间就是入队时间，旧任务无需迁移即可检查有效期。
-            queued_at = int(message_id.split("-", 1)[0]) / 1000
-            if now - queued_at >= TASK_MAX_AGE_SECONDS:
+            if self.task_expired(message_id, task, now_us):
                 await self.store.finish(message_id, task, "expired")
                 continue
             if not await self.store.has_matching_subscription(task):
@@ -154,7 +173,7 @@ class Worker:
                     if not await self.store.renew():
                         self.active.clear()
                         return
-                    if (await self.store.time_us()) / 1_000_000 - queued_at >= TASK_MAX_AGE_SECONDS:
+                    if self.task_expired(message_id, task, await self.store.time_us()):
                         await self.store.finish(message_id, task, "expired")
                         continue
                     if not await self.store.has_matching_subscription(task):

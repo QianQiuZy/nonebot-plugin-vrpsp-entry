@@ -1,7 +1,7 @@
 import httpx
 
 from .config import Config
-from .models import Entry, parse_entries
+from .models import Entry, RedPocket, parse_entries, parse_red_pockets
 
 
 class Client:
@@ -19,10 +19,11 @@ class Client:
             headers={"User-Agent": "nonebot-plugin-vrpsp-entry/0.1"},
         )
 
-    async def fetch(self, source: str) -> list[Entry]:
+    async def fetch(self, source: str) -> list[Entry | RedPocket]:
         response = await self.http.get(self.urls[source], params={"cache": 1})
         response.raise_for_status()
-        return parse_entries(response.json())
+        payload = response.json()
+        return [*parse_entries(payload), *parse_red_pockets(payload)]
 
     async def close(self) -> None:
         await self.http.aclose()

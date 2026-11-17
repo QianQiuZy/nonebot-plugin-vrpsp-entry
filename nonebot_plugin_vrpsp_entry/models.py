@@ -7,6 +7,7 @@ from pathlib import Path
 SHANGHAI = timezone(timedelta(hours=8))
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 RESOURCE = Path(__file__).resolve().parent / "resource"
+POCKET_NAMES = {"guard": "舰长红包", "battery": "电池红包", "gift": "礼物红包"}
 
 
 def parse_id(value: str) -> int:
@@ -16,6 +17,15 @@ def parse_id(value: str) -> int:
     if not 0 < number < 2**64:
         raise ValueError("ID 超出有效范围")
     return number
+
+
+def parse_price(value: str) -> int:
+    if not value.isascii() or not value.isdecimal() or len(value) > 16:
+        raise ValueError("请输入非负整数价格")
+    price = int(value)
+    if price > 2**53 - 1:
+        raise ValueError("价格超出有效范围")
+    return price
 
 
 @dataclass(frozen=True)
@@ -32,6 +42,23 @@ class Entry:
     def delivery_key(self, group: str) -> str:
         # 来源和 Bot ID 不参与：同一事件命中 VR/PSP/VUP、房间/用户都只投递一次。
         raw = f"{group}:{self.room_id}:{self.uid}:{self.time_us}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class RedPocket:
+    room_id: int
+    pocket_type: str
+    amount: int
+    when: datetime
+
+    @property
+    def time_us(self) -> int:
+        delta = self.when - EPOCH
+        return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+    def delivery_key(self, group: str) -> str:
+        raw = f"pocket:{group}:{self.room_id}:{self.pocket_type}:{self.amount}:{self.time_us}"
         return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -61,6 +88,47 @@ def parse_entries(payload: object) -> list[Entry]:
     return sorted(result, key=lambda item: (item.time_us, item.room_id, item.uid))
 
 
+def parse_red_pockets(payload: object) -> list[RedPocket]:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("mode") != "cache"
+        or type(payload.get("cache")) is not int
+        or payload["cache"] != 1
+    ):
+        raise ValueError("invalid red pocket response")
+    rows = payload.get("red_pocket", [])  # Sources not upgraded yet still provide entry events.
+    if not isinstance(rows, list):
+        raise ValueError("invalid red pocket list")
+    result = set()
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("pocket_type"), str)
+            or row["pocket_type"] not in POCKET_NAMES
+        ):
+            raise ValueError("invalid red pocket row")
+        room, kind = row.get("room_id"), row["pocket_type"]
+        amount = row.get(kind + "_num")
+        if (
+            type(room) is not int
+            or not 0 < room < 2**64
+            or type(amount) is not int
+            or not 0 <= amount <= 2**53 - 1
+            or (kind == "guard" and amount <= 0)
+        ):
+            raise ValueError("invalid red pocket identity or amount")
+        value = row.get("event_time")
+        if not isinstance(value, str):
+            raise ValueError("invalid red pocket timestamp")
+        when = datetime.fromisoformat(value)
+        if when.tzinfo is None:
+            raise ValueError("red pocket timestamp must contain timezone")
+        result.add(RedPocket(room, kind, amount, when.astimezone(SHANGHAI)))
+    return sorted(
+        result, key=lambda item: (item.time_us, item.room_id, item.pocket_type, item.amount)
+    )
+
+
 class Names:
     def __init__(self, directory: Path = RESOURCE):
         rows = json.loads((directory / "entry_users.json").read_text(encoding="utf-8-sig"))
@@ -81,3 +149,12 @@ class Names:
     def message(self, entry: Entry) -> str:
         clock = entry.when.astimezone(SHANGHAI).strftime("%H:%M:%S")
         return f"{self.user(entry.uid)}在{clock}进入了{self.room(entry.room_id)}的直播间"
+
+    def pocket_message(self, pocket: RedPocket) -> str:
+        unit = "个" if pocket.pocket_type == "guard" else "电池"
+        clock = pocket.when.astimezone(SHANGHAI).strftime("%H:%M:%S")
+        return (
+            f"{self.room(pocket.room_id)}有红包啦！\n"
+            f"{POCKET_NAMES[pocket.pocket_type]}{pocket.amount}{unit}\n"
+            f"开始时间：{clock}"
+        )

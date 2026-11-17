@@ -99,7 +99,16 @@ async def test_bad_id_never_calls_redis(app, monkeypatch):
 
 @pytest.mark.parametrize(
     "command,text,user",
-    [("list", "/入场订阅列表", 308025580), ("public_list", "/入场订阅", 12345)],
+    [
+        ("list", "/入场订阅列表", 308025580),
+        ("public_list", "/入场订阅", 12345),
+        ("pocket_guard_add", "/舰长红包订阅", 308025580),
+        ("pocket_battery_add", "/电池红包订阅 100", 308025580),
+        ("pocket_gift_add", "/礼物红包订阅 100", 308025580),
+        ("pocket_guard_remove", "/舰长红包订阅取消", 308025580),
+        ("pocket_battery_remove", "/电池红包订阅取消", 308025580),
+        ("pocket_gift_remove", "/礼物红包订阅取消", 308025580),
+    ],
 )
 async def test_private_command_is_rejected(app, command, text, user):
     async with app.test_matcher(plugin.commands[command]) as ctx:
@@ -196,13 +205,153 @@ async def test_public_listing_is_open_with_requested_format(app, monkeypatch, ro
         ctx.receive_event(bot, event)
         ctx.should_call_send(
             event,
-            "当前群聊订阅情况\n房间订阅：花礼Harei\n用户订阅：泽音Melody",
+            "当前群聊订阅情况\n房间订阅：花礼Harei\n用户订阅：泽音Melody"
+            "\n舰长红包订阅：无\n电池红包订阅：无\n礼物红包订阅：无",
             result={"message_id": 1},
         )
         ctx.should_pass_rule()
     store.subscriptions.assert_awaited_once_with("10")
     store.subscribe.assert_not_awaited()
     store.unsubscribe.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "kind,label,argument,minimum",
+    [
+        ("guard", "舰长红包", "", 0),
+        ("battery", "电池红包", " 100", 100),
+        ("gift", "礼物红包", " 520", 520),
+    ],
+)
+@pytest.mark.parametrize("result,verb", [(1, "已订阅"), (2, "已更新"), (0, "本群已订阅")])
+async def test_pocket_subscribe_commands(
+    app, monkeypatch, kind, label, argument, minimum, result, verb
+):
+    store = AsyncMock()
+    store.subscribe_pocket.return_value = result
+    monkeypatch.setattr(plugin.worker, "store", store)
+    condition = "不限价格" if kind == "guard" else f"价格≥{minimum}电池"
+    suffix = "；仅推送设置后的新红包" if result else ""
+    async with app.test_matcher(plugin.commands[f"pocket_{kind}_add"]) as ctx:
+        bot = ctx.create_bot(base=Bot, self_id="1")
+        event = group_event(f"/{label}订阅{argument}", user=308025580, group=42)
+        ctx.receive_event(bot, event)
+        ctx.should_call_send(
+            event, f"{verb}{label}（{condition}）{suffix}", result={"message_id": 1}
+        )
+        ctx.should_pass_rule()
+    store.subscribe_pocket.assert_awaited_once_with("42", kind, minimum, "1")
+
+
+@pytest.mark.parametrize(
+    "kind,label",
+    [
+        ("guard", "舰长红包"),
+        ("battery", "电池红包"),
+        ("gift", "礼物红包"),
+    ],
+)
+async def test_pocket_cancel_commands(app, monkeypatch, kind, label):
+    store = AsyncMock()
+    store.unsubscribe_pocket.return_value = True
+    monkeypatch.setattr(plugin.worker, "store", store)
+    async with app.test_matcher(plugin.commands[f"pocket_{kind}_remove"]) as ctx:
+        bot = ctx.create_bot(base=Bot, self_id="1")
+        event = group_event(f"/{label}订阅取消", user=308025580)
+        ctx.receive_event(bot, event)
+        ctx.should_call_send(event, f"已取消{label}订阅", result={"message_id": 1})
+        ctx.should_pass_rule()
+    store.unsubscribe_pocket.assert_awaited_once_with("10", kind)
+
+
+@pytest.mark.parametrize(
+    "command,text,usage",
+    [
+        ("pocket_guard_add", "/舰长红包订阅 100", "/舰长红包订阅"),
+        ("pocket_battery_add", "/电池红包订阅", "/电池红包订阅 <最低价格>"),
+        ("pocket_gift_add", "/礼物红包订阅 -1", "/礼物红包订阅 <最低价格>"),
+        ("pocket_battery_add", "/电池红包订阅 100.5", "/电池红包订阅 <最低价格>"),
+        ("pocket_gift_remove", "/礼物红包订阅取消 100", "/礼物红包订阅取消"),
+    ],
+)
+async def test_pocket_argument_validation(app, monkeypatch, command, text, usage):
+    store = AsyncMock()
+    monkeypatch.setattr(plugin.worker, "store", store)
+    async with app.test_matcher(plugin.commands[command]) as ctx:
+        bot = ctx.create_bot(base=Bot, self_id="1")
+        event = group_event(text, user=308025580)
+        ctx.receive_event(bot, event)
+        ctx.should_call_send(event, "用法：" + usage, result={"message_id": 1})
+        ctx.should_pass_rule()
+    assert store.mock_calls == []
+
+
+@pytest.mark.parametrize(
+    "kind,label",
+    [
+        ("guard", "舰长红包"),
+        ("battery", "电池红包"),
+        ("gift", "礼物红包"),
+    ],
+)
+@pytest.mark.parametrize("remove", [False, True])
+@pytest.mark.parametrize("role", ["member", "owner", "admin"])
+async def test_pocket_management_keeps_whitelist_only(app, monkeypatch, kind, label, remove, role):
+    store = AsyncMock()
+    monkeypatch.setattr(plugin.worker, "store", store)
+    name = label + ("订阅取消" if remove else "订阅")
+    argument = " 100" if kind != "guard" and not remove else ""
+    async with app.test_matcher(
+        plugin.commands[f"pocket_{kind}_{'remove' if remove else 'add'}"]
+    ) as ctx:
+        bot = ctx.create_bot(base=Bot, self_id="1")
+        event = group_event(f"/{name}{argument}", user=99, role=role)
+        ctx.receive_event(bot, event)
+        ctx.should_call_send(event, DENIED, result={"message_id": 1})
+        ctx.should_pass_rule()
+    assert store.mock_calls == []
+
+
+async def test_public_listing_shows_all_pocket_settings(app, monkeypatch):
+    store = AsyncMock()
+    store.subscriptions.return_value = {
+        "10:room:1820703922": {},
+        "10:user:1203217682": {},
+        "10:pocket_guard:0": {"min_price": "0"},
+        "10:pocket_battery:0": {"min_price": "100"},
+        "10:pocket_gift:0": {"min_price": "520"},
+    }
+    monkeypatch.setattr(plugin.worker, "store", store)
+    async with app.test_matcher(plugin.commands["public_list"]) as ctx:
+        bot = ctx.create_bot(base=Bot, self_id="1")
+        event = group_event("/入场订阅", user=12345)
+        ctx.receive_event(bot, event)
+        ctx.should_call_send(
+            event,
+            "当前群聊订阅情况\n房间订阅：花礼Harei\n用户订阅：泽音Melody"
+            "\n舰长红包订阅：不限价格\n电池红包订阅：价格≥100电池\n礼物红包订阅：价格≥520电池",
+            result={"message_id": 1},
+        )
+        ctx.should_pass_rule()
+    store.subscriptions.assert_awaited_once_with("10")
+
+
+@pytest.mark.parametrize("remove", [False, True])
+async def test_pocket_redis_failure_is_reported_safely(app, monkeypatch, remove):
+    store = AsyncMock()
+    method = store.unsubscribe_pocket if remove else store.subscribe_pocket
+    method.side_effect = ConnectionError("synthetic-sensitive-url")
+    monkeypatch.setattr(plugin.worker, "store", store)
+    command = "pocket_battery_remove" if remove else "pocket_battery_add"
+    text = "/电池红包订阅取消" if remove else "/电池红包订阅 100"
+    async with app.test_matcher(plugin.commands[command]) as ctx:
+        bot = ctx.create_bot(base=Bot, self_id="1")
+        event = group_event(text, user=308025580)
+        ctx.receive_event(bot, event)
+        ctx.should_call_send(event, "Redis 暂不可用，请稍后查询或重试", result={"message_id": 1})
+        ctx.should_pass_rule()
+    method.assert_awaited_once()
+    store.subscriptions.assert_not_awaited()
 
 
 async def test_public_empty_listing(app, monkeypatch):
@@ -214,6 +363,9 @@ async def test_public_empty_listing(app, monkeypatch):
         event = group_event("/入场订阅", user=12345)
         ctx.receive_event(bot, event)
         ctx.should_call_send(
-            event, "当前群聊订阅情况\n房间订阅：无\n用户订阅：无", result={"message_id": 1}
+            event,
+            "当前群聊订阅情况\n房间订阅：无\n用户订阅：无"
+            "\n舰长红包订阅：无\n电池红包订阅：无\n礼物红包订阅：无",
+            result={"message_id": 1},
         )
         ctx.should_pass_rule()

@@ -3,13 +3,85 @@ import json
 from datetime import timedelta
 
 from nonebot_plugin_vrpsp_entry.config import Config
-from nonebot_plugin_vrpsp_entry.models import EPOCH, Entry
+from nonebot_plugin_vrpsp_entry.models import EPOCH, Entry, RedPocket
 from nonebot_plugin_vrpsp_entry.store import CONSUMER_GROUP, Store
 
 
 async def new_entry(store, offset=0, room=1820703922, uid=1203217682):
     stamp = await store.time_us()
     return Entry(room, uid, EPOCH + timedelta(microseconds=stamp + offset))
+
+
+async def new_pocket(store, kind="battery", amount=100, offset=0, room=1820703922):
+    stamp = await store.time_us()
+    return RedPocket(room, kind, amount, EPOCH + timedelta(microseconds=stamp + offset))
+
+
+async def test_pocket_subscriptions_update_only_their_type_and_keep_entry_data(store):
+    await store.subscribe("10", "room", 1820703922, "1")
+    original = (await store.subscriptions("10"))["10:room:1820703922"]
+    assert await store.subscribe_pocket("10", "battery", 100, "1") == 1
+    first = (await store.subscriptions("10"))["10:pocket_battery:0"]
+    assert await store.subscribe_pocket("10", "battery", 100, "2") == 0
+    assert (await store.subscriptions("10"))["10:pocket_battery:0"] == first
+    assert await store.subscribe_pocket("10", "battery", 200, "1") == 2
+    second = (await store.subscriptions("10"))["10:pocket_battery:0"]
+    assert second["min_price"] == "200" and second["token"] != first["token"]
+    assert await store.subscribe_pocket("10", "gift", 520, "1") == 1
+    assert await store.unsubscribe_pocket("10", "battery")
+    assert not await store.unsubscribe_pocket("10", "battery")
+    rows = await store.subscriptions("10")
+    assert "10:pocket_gift:0" in rows and "10:pocket_battery:0" not in rows
+    assert rows["10:room:1820703922"] == original
+    assert await store.subscriptions("11") == {}
+
+
+async def test_pocket_enqueue_checks_price_cutoff_and_duplicates_atomically(store):
+    before = await new_pocket(store)
+    await store.subscribe_pocket("10", "battery", 100, "1")
+    assert not await store.enqueue_pocket("10", before, "old", "1")
+    assert not await store.enqueue_pocket("10", await new_pocket(store, amount=99), "low", "1")
+    pocket = await new_pocket(store)
+    results = await asyncio.gather(
+        *(store.enqueue_pocket("10", pocket, "new", "1") for _ in range(10))
+    )
+    assert sum(results) == 1
+    message_id, task = (await store.read(">"))[0]
+    assert len(task["matches"]) == 1
+    assert int(task["expires_us"]) == pocket.time_us + 600_000_000
+    assert await store.has_matching_subscription(task)
+    assert await store.subscribe_pocket("10", "battery", 0, "1") == 2
+    assert not await store.has_matching_subscription(task)
+    await store.finish(message_id, task, "cancelled")
+    assert not await store.enqueue_pocket("10", pocket, "do not revive", "1")
+
+
+async def test_pocket_enqueue_rechecks_threshold_changed_after_poll_snapshot(store):
+    await store.subscribe_pocket("10", "gift", 100, "1")
+    await store.subscribe_pocket("10", "gift", 520, "1")
+    pocket = await new_pocket(store, kind="gift", amount=519)
+    assert not await store.enqueue_pocket("10", pocket, "below new threshold", "1")
+    qualifying = await new_pocket(store, kind="gift", amount=520)
+    assert await store.enqueue_pocket("10", qualifying, "equal threshold", "1")
+
+
+async def test_pocket_expired_future_and_restart_subscription_persistence(store, redis_url):
+    await store.subscribe_pocket("10", "guard", 0, "1")
+    await store.subscribe_pocket("10", "battery", 100, "1")
+    assert not await store.enqueue_pocket(
+        "10", await new_pocket(store, offset=-600_000_000), "expired"
+    )
+    assert not await store.enqueue_pocket(
+        "10", await new_pocket(store, offset=100_000_000), "future"
+    )
+    restarted = Store(Config(vrpsp_entry_redis_url=redis_url, vrpsp_entry_key_prefix=store.prefix))
+    try:
+        assert await restarted.subscriptions("10") == await store.subscriptions("10")
+        assert await restarted.unsubscribe_pocket("10", "guard")
+        assert "10:pocket_guard:0" not in await store.subscriptions("10")
+        assert "10:pocket_battery:0" in await store.subscriptions("10")
+    finally:
+        await restarted.close()
 
 
 async def test_overlap_and_concurrent_duplicate_enqueue_once_per_group(store):

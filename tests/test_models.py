@@ -3,7 +3,14 @@ from datetime import datetime, timezone
 import pytest
 
 from nonebot_plugin_vrpsp_entry.config import Config, is_allowed
-from nonebot_plugin_vrpsp_entry.models import Entry, Names, parse_entries, parse_id
+from nonebot_plugin_vrpsp_entry.models import (
+    Entry,
+    Names,
+    parse_entries,
+    parse_id,
+    parse_price,
+    parse_red_pockets,
+)
 
 
 def payload(time="2026-10-08T22:30:00+08:00", **changes):
@@ -76,3 +83,74 @@ def test_default_authorization_and_config_validation():
             Config(**changes)
     entry = Entry(1, 2, datetime(2026, 1, 1, tzinfo=timezone.utc))
     assert entry.time_us == 1767225600000000
+
+
+@pytest.mark.parametrize(
+    "kind,amount,expected",
+    [
+        ("guard", 5, "花礼Harei有红包啦！\n舰长红包5个\n开始时间：01:02:03"),
+        ("battery", 100, "花礼Harei有红包啦！\n电池红包100电池\n开始时间：01:02:03"),
+        ("gift", 520, "花礼Harei有红包啦！\n礼物红包520电池\n开始时间：01:02:03"),
+    ],
+)
+def test_pocket_parsing_deduplication_and_exact_notification(kind, amount, expected):
+    data = {
+        "mode": "cache",
+        "cache": 1,
+        "items": [],
+        "red_pocket": [
+            {
+                "room_id": 1820703922,
+                "pocket_type": kind,
+                kind + "_num": amount,
+                "event_time": "2026-11-16T01:02:03+08:00",
+            }
+        ],
+    }
+    first = parse_red_pockets(data)[0]
+    data["red_pocket"].append({**data["red_pocket"][0], "event_time": "2026-11-15T17:02:03+00:00"})
+    assert parse_red_pockets(data) == [first]
+    assert Names().pocket_message(first) == expected
+    assert first.delivery_key("1") != first.delivery_key("2")
+    assert first.delivery_key("1") != Entry(first.room_id, 5, first.when).delivery_key("1")
+
+
+def test_older_source_without_pocket_field_is_compatible():
+    assert parse_red_pockets(payload()) == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"room_id": True},
+        {"room_id": 0},
+        {"pocket_type": []},
+        {"pocket_type": "unknown"},
+        {"battery_num": "100"},
+        {"battery_num": True},
+        {"battery_num": -1},
+        {"battery_num": 2**53},
+        {"event_time": "2026-11-16T01:02:03"},
+        {"event_time": "bad"},
+    ],
+)
+def test_invalid_pocket_response_is_rejected(changes):
+    row = {
+        "room_id": 1820703922,
+        "pocket_type": "battery",
+        "battery_num": 100,
+        "event_time": "2026-11-16T01:02:03+08:00",
+        **changes,
+    }
+    with pytest.raises(ValueError):
+        parse_red_pockets({"mode": "cache", "cache": 1, "red_pocket": [row]})
+
+
+@pytest.mark.parametrize("value", ["-1", "100.0", "100 200", "１２３", str(2**53), ""])
+def test_invalid_pocket_price(value):
+    with pytest.raises(ValueError):
+        parse_price(value)
+
+
+def test_zero_price_allows_all_battery_and_gift_pockets():
+    assert parse_price("0") == 0

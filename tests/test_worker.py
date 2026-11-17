@@ -10,10 +10,10 @@ from nonebot.adapters.onebot.v11 import Bot
 from nonebot_plugin_vrpsp_entry import sending
 from nonebot_plugin_vrpsp_entry.client import Client
 from nonebot_plugin_vrpsp_entry.config import Config
-from nonebot_plugin_vrpsp_entry.models import Names, parse_entries
+from nonebot_plugin_vrpsp_entry.models import SHANGHAI, Names, parse_entries
 from nonebot_plugin_vrpsp_entry.worker import Worker
 
-from .test_store import new_entry
+from .test_store import new_entry, new_pocket
 
 
 @pytest.fixture
@@ -351,3 +351,125 @@ def test_text_segments_cannot_inject_cq_codes():
     message = Message(MessageSegment.text(names.message(entry)))
     assert len(message) == 1
     assert message[0].type == "text"
+
+
+async def test_pockets_cross_source_threshold_scope_and_exact_notifications(worker, store):
+    await store.subscribe_pocket("10", "guard", 0, "1")
+    await store.subscribe_pocket("10", "battery", 100, "1")
+    await store.subscribe_pocket("10", "gift", 520, "1")
+    await store.subscribe(
+        "11", "room", 1820703922, "1"
+    )  # Entry subscriptions do not imply pockets.
+    guard = await new_pocket(store, kind="guard", amount=5)
+    battery = await new_pocket(store, amount=100)
+    gift = await new_pocket(store, kind="gift", amount=520)
+    low = await new_pocket(store, amount=99)
+    low_gift = await new_pocket(store, kind="gift", amount=519)
+    future = await new_pocket(store, offset=100_000_000)
+    old = await new_pocket(store, offset=-600_000_000)
+    worker.client.fetch.return_value = [guard, battery, gift, low, low_gift, future, old]
+    await worker.poll_once()
+    await worker.poll_once()
+    await worker.send_once()
+    bot = worker.bots()["1"]
+    assert bot.send_group_msg.await_count == 3
+    calls = [call.kwargs for call in bot.send_group_msg.call_args_list]
+    assert all(call["group_id"] == 10 for call in calls)
+    assert [call["message"].extract_plain_text() for call in calls] == [
+        "花礼Harei有红包啦！\n舰长红包5个\n开始时间："
+        + guard.when.astimezone(SHANGHAI).strftime("%H:%M:%S"),
+        "花礼Harei有红包啦！\n电池红包100电池\n开始时间："
+        + battery.when.astimezone(SHANGHAI).strftime("%H:%M:%S"),
+        "花礼Harei有红包啦！\n礼物红包520电池\n开始时间："
+        + gift.when.astimezone(SHANGHAI).strftime("%H:%M:%S"),
+    ]
+    assert await store.redis.xlen(store.outbox) == 0
+
+
+@pytest.mark.parametrize("kind,amount", [("guard", 50), ("battery", 100), ("gift", 520)])
+async def test_pocket_cancellation_discards_pending_message(worker, store, kind, amount):
+    await store.subscribe_pocket("10", kind, 0, "1")
+    pocket = await new_pocket(store, kind=kind, amount=amount)
+    assert await store.enqueue_pocket("10", pocket, "queued", "1")
+    assert await store.unsubscribe_pocket("10", kind)
+    await worker.send_once()
+    worker.bots()["1"].send_group_msg.assert_not_awaited()
+    assert await store.redis.xlen(store.outbox) == 0
+
+
+async def test_expired_red_pocket_is_discarded_even_offline_before_retry_due(
+    worker, store, monkeypatch
+):
+    await store.subscribe_pocket("10", "battery", 0, "1")
+    pocket = await new_pocket(store)
+    assert await store.enqueue_pocket("10", pocket, "expired", "1")
+    message_id, _ = (await store.read(">"))[0]
+    now_us = pocket.time_us + 600_000_000
+    await store.defer(message_id, now_us / 1_000_000)
+    monkeypatch.setattr(store, "time_us", AsyncMock(return_value=now_us))
+    worker.bots = lambda: {}
+    await worker.send_once()
+    assert await store.redis.xlen(store.outbox) == 0
+    assert not await store.redis.hgetall(store.retry)
+    assert await store.redis.get(store.prefix + "seen:" + pocket.delivery_key("10")) == "expired"
+
+
+@pytest.mark.parametrize("change", ["expiry", "cancel", "threshold", "account"])
+async def test_pocket_waiting_send_slot_rechecks_validity(worker, store, monkeypatch, change):
+    await store.subscribe_pocket("10", "battery", 100, "1")
+    pocket = await new_pocket(store)
+    assert await store.enqueue_pocket("10", pocket, "queued", "1")
+    bot = worker.bots()["1"]
+
+    @asynccontextmanager
+    async def changed():
+        if change == "expiry":
+            monkeypatch.setattr(
+                store, "time_us", AsyncMock(return_value=pocket.time_us + 600_000_000)
+            )
+        elif change == "cancel":
+            await store.unsubscribe_pocket("10", "battery")
+        elif change == "threshold":
+            await store.subscribe_pocket("10", "battery", 200, "1")
+        else:
+            worker.bots = lambda: {"2": bot}
+        yield
+
+    monkeypatch.setattr(sending.limiter, "slot", changed)
+    await worker.send_once()
+    bot.send_group_msg.assert_not_awaited()
+    await worker.send_once()  # Cancellation after acquiring a slot cleans up on the next scan.
+    assert await store.redis.xlen(store.outbox) == 0
+
+
+async def test_client_parses_new_field_without_losing_entries():
+    body = {
+        "mode": "cache",
+        "cache": 1,
+        "items": [
+            {"room_id": 1820703922, "uid": 1203217682, "event_time": "2026-11-16T01:02:03+08:00"}
+        ],
+        "red_pocket": [
+            {
+                "room_id": 1820703922,
+                "pocket_type": "battery",
+                "battery_num": 100,
+                "event_time": "2026-11-16T01:02:03+08:00",
+            }
+        ],
+    }
+    client = Client(Config())
+    await client.http.aclose()
+    client.http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body))
+    )
+    try:
+        events = await client.fetch("vup")
+        assert len(events) == 2
+        assert Names().message(events[0]) == "泽音Melody在01:02:03进入了花礼Harei的直播间"
+        assert (
+            Names().pocket_message(events[1])
+            == "花礼Harei有红包啦！\n电池红包100电池\n开始时间：01:02:03"
+        )
+    finally:
+        await client.close()

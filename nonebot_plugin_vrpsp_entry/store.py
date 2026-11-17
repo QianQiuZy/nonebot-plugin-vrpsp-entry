@@ -5,7 +5,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from .config import Config
-from .models import Entry
+from .models import POCKET_NAMES, Entry, RedPocket
 
 LEASE_SECONDS = 60
 DEDUPE_SECONDS = 86400
@@ -21,29 +21,42 @@ if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
 return redis.call('DEL', KEYS[1])
 """
 SUBSCRIBE = """
-if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return 0 end
-local clock = redis.call('TIME')
 local sub = cjson.decode(ARGV[2])
+local previous = redis.call('HGET', KEYS[1], ARGV[1])
+if previous then
+    local old = cjson.decode(previous)
+    if not sub.min_price or old.min_price == sub.min_price then return 0 end
+end
+local clock = redis.call('TIME')
 sub.since_us = string.format('%.0f', tonumber(clock[1]) * 1000000 + tonumber(clock[2]))
 redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(sub))
+if previous then return 2 end
 return 1
 """
 ENQUEUE = """
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
 if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
+local task = cjson.decode(ARGV[5])
+if task.expires_us then
+    local clock = redis.call('TIME')
+    local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
+    if now >= tonumber(task.expires_us) or tonumber(ARGV[4]) > now then
+        return 0
+    end
+end
 local matches = {}
 for index = 2, 3 do
     local value = redis.call('HGET', KEYS[2], ARGV[index])
     if value then
         local sub = cjson.decode(value)
-        if tonumber(sub.since_us) <= tonumber(ARGV[4]) then
+        if tonumber(sub.since_us) <= tonumber(ARGV[4]) and
+           (not task.pocket_type or tonumber(sub.min_price) <= tonumber(task.amount)) then
             local bot_id = ARGV[7] ~= '' and ARGV[7] or sub.bot_id
             table.insert(matches, {field=ARGV[index], token=sub.token, bot_id=bot_id})
         end
     end
 end
 if #matches == 0 then return 0 end
-local task = cjson.decode(ARGV[5])
 task.matches = matches
 redis.call('XADD', KEYS[4], '*', 'task', cjson.encode(task))
 redis.call('SET', KEYS[3], 'queued', 'EX', ARGV[6])
@@ -110,6 +123,23 @@ class Store:
     async def unsubscribe(self, group: str, kind: str, identity: int) -> bool:
         return bool(await self.redis.hdel(self.subs, self.field(group, kind, identity)))
 
+    async def subscribe_pocket(self, group: str, kind: str, minimum: int, bot_id: str) -> int:
+        if kind not in POCKET_NAMES or type(minimum) is not int or not 0 <= minimum <= 2**53 - 1:
+            raise ValueError("invalid pocket subscription")
+        if kind == "guard":
+            minimum = 0
+        sub = json.dumps({"bot_id": bot_id, "token": uuid.uuid4().hex, "min_price": str(minimum)})
+        return int(
+            await self.redis.eval(
+                SUBSCRIBE, 1, self.subs, self.field(group, "pocket_" + kind, 0), sub
+            )
+        )
+
+    async def unsubscribe_pocket(self, group: str, kind: str) -> bool:
+        if kind not in POCKET_NAMES:
+            raise ValueError("invalid pocket type")
+        return await self.unsubscribe(group, "pocket_" + kind, 0)
+
     async def subscriptions(self, group: str | None = None) -> dict[str, dict]:
         rows = await self.redis.hgetall(self.subs)
         return {
@@ -150,6 +180,39 @@ class Store:
             for _, items in rows
             for message_id, fields in items
         ]
+
+    async def enqueue_pocket(
+        self, group: str, pocket: RedPocket, message: str, bot_id: str | None = None
+    ) -> bool:
+        key = pocket.delivery_key(group)
+        task = json.dumps(
+            {
+                "group": group,
+                "key": key,
+                "message": message,
+                "pocket_type": pocket.pocket_type,
+                "amount": str(pocket.amount),
+                "expires_us": str(pocket.time_us + 600_000_000),
+            },
+            ensure_ascii=False,
+        )
+        return bool(
+            await self.redis.eval(
+                ENQUEUE,
+                4,
+                self.lease,
+                self.subs,
+                self.prefix + "seen:" + key,
+                self.outbox,
+                self.owner,
+                self.field(group, "pocket_" + pocket.pocket_type, 0),
+                "",
+                pocket.time_us,
+                task,
+                DEDUPE_SECONDS,
+                bot_id or "",
+            )
+        )
 
     async def has_matching_subscription(self, task: dict) -> bool:
         matches = task["matches"]
